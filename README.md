@@ -139,8 +139,90 @@ Options:
                               RECORD_SKIP_LIST env var (see README for more
                               details).
   --exclude-deleted           Pass to exclude deleted records from harvest.
+  --state-dir PATH            Directory in which to persist harvested records
+                              and progress for a resumable harvest. Only
+                              supported with --method=list and a local output
+                              file. Resuming requires passing --resume
+                              alongside this option.
+  --checkpoint-every INTEGER  Save progress at least once per this many
+                              harvested records. Must be a positive integer.
+                              Only used together with --state-dir.  [default:
+                              1000]
+  --resume                    Resume the harvest previously persisted in
+                              --state-dir. All other harvest parameters must
+                              match the original run.
   --help                      Show this message and exit.
 ```
+
+### Resumable harvests (`harvest --method list`)
+
+A long-running `list` harvest can be interrupted and later continued without
+losing the records already retrieved. The feature is opt-in: runs without
+`--state-dir` behave exactly as before and write the output file directly.
+Resumable harvests require `--method list` and a **local** output file;
+combining `--state-dir` with `--method get` or an `s3://` output is a
+parameter error.
+
+Options:
+
+- `--state-dir PATH` — directory in which harvested records, the resumption
+  token and the harvest parameters are persisted. The directory is created if
+  it does not exist.
+- `--checkpoint-every N` — progress is saved at least once every `N` newly
+  harvested records (positive integer, default `1000`), and always at page
+  boundaries.
+- `--resume` — continue the harvest previously saved in `--state-dir`. A state
+  directory that already contains a harvest cannot be reused without this flag.
+
+First run:
+
+```shell
+oai -h http://127.0.0.1:8765/oai -o output.xml harvest --method list \
+  --state-dir .harvest-state --checkpoint-every 3
+```
+
+Resume after an interruption (use the identical host, output path, metadata
+format, dates, set and deleted-record settings):
+
+```shell
+oai -h http://127.0.0.1:8765/oai -o output.xml harvest --method list \
+  --state-dir .harvest-state --checkpoint-every 3 --resume
+```
+
+Guarantees and behavior:
+
+- Records are written in the same UTF-8 `<records>` XML format. Identifiers are
+  deduplicated on disk (a SQLite database), keeping first-seen order, so
+  re-fetching a page after a restart never produces duplicates; neither the
+  full record set nor all identifiers are held in memory.
+- The final output path is only touched once the complete document has been
+  assembled and checksum-verified, when it is published atomically. Until then
+  an existing output file stays byte-for-byte unchanged, and a failed first run
+  leaves no output file behind. A legal empty result succeeds and writes an
+  empty `<records>` document.
+- Failures exit non-zero and leave resumable state behind. If the server
+  rejects the saved resumption token (`badResumptionToken`), the harvest
+  restarts from the original query and relies on the saved state to
+  deduplicate; any other protocol error preserves the state and fails clearly.
+- Resuming verifies the saved host, absolute output path, metadata format,
+  date range, set and `--exclude-deleted` setting against the new arguments and
+  fails before writing anything if they differ.
+- An OS lock in the state directory prevents two processes harvesting the same
+  directory at once; a process that dies (including a hard kill) releases the
+  lock automatically, so the directory remains recoverable.
+- Re-running `--resume` on a successfully completed harvest succeeds without
+  re-contacting the server and leaves the output and completion state
+  unchanged. If the process died after replacing the output but before marking
+  the harvest complete, the next resume detects this and finishes cleanly.
+
+State directory contents:
+
+| File | Purpose |
+| --- | --- |
+| `manifest.json` | Harvest parameters, current resumption token, run status, record count and the staged document checksum. |
+| `records.sqlite3` | On-disk record store and deduplication index, in first-seen order. |
+| `staging.xml` | Complete output document, built before being atomically moved to the output path; removed once the harvest is marked complete. |
+| `harvest.lock` | OS byte-range lock guarding against concurrent processes. |
 
 ### `oai setlist`
 ```

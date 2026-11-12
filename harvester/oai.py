@@ -5,14 +5,16 @@
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import smart_open
 from requests import RequestException
-from sickle import Sickle
+from sickle import Sickle, oaiexceptions
 from sickle.models import Record
 from sickle.oaiexceptions import IdDoesNotExist, OAIError
 
+from harvester.checkpoint import HarvestedRecord, Page
 from harvester.config import (
     DEFAULT_RETRY_AFTER,
     MAX_ALLOWED_ERRORS,
@@ -26,6 +28,24 @@ from harvester.utils import send_sentry_message
 logger = logging.getLogger(__name__)
 
 CONFIG = Config()
+
+
+@dataclass(frozen=True)
+class FetchedRecord:
+    """Sickle-agnostic view of one record, satisfying :class:`HarvestedRecord`."""
+
+    identifier: str | None
+    deleted: bool
+    raw: str
+
+
+def _adapt_record(sickle_record: Record) -> FetchedRecord:
+    """Project the fields the checkpoint engine needs from a sickle record."""
+    return FetchedRecord(
+        identifier=sickle_record.header.identifier,
+        deleted=sickle_record.deleted,
+        raw=sickle_record.raw,
+    )
 
 
 class OAIClient:
@@ -142,6 +162,50 @@ class OAIClient:
 
     def list_records(self, exclude_deleted: bool) -> Iterator[Record]:
         return self.client.ListRecords(ignore_deleted=exclude_deleted, **self.params)
+
+    def list_records_page(
+        self, exclude_deleted: bool, resumption_token: str | None
+    ) -> Page:
+        """Fetch one ListRecords page without hiding resumption details.
+
+        Unlike :meth:`list_records`, which returns a sickle iterator, this
+        performs a single HTTP request and returns the page's records together
+        with the next resumption token.  It mirrors sickle's response parsing
+        and OAI error mapping so record contents are identical.
+
+        Args:
+            exclude_deleted: Whether deleted records on the page are filtered.
+            resumption_token: Token for the page to fetch; ``None`` issues the
+                initial query with the configured harvest parameters.
+
+        Returns:
+            A :class:`~harvester.checkpoint.Page` for the response.
+        """
+        if resumption_token:
+            params = {"verb": "ListRecords", "resumptionToken": resumption_token}
+        else:
+            params = {"verb": "ListRecords", **self.params}
+        response = self.client.harvest(**params)
+        xml = response.xml
+        error = xml.find(".//" + self.client.oai_namespace + "error")
+        if error is not None:
+            code = error.attrib.get("code", "UNKNOWN")
+            description = error.text or ""
+            exception_class = getattr(oaiexceptions, code[0].upper() + code[1:], None)
+            if exception_class is None:
+                raise OAIError(description)
+            raise exception_class(description)
+        token_element = xml.find(".//" + self.client.oai_namespace + "resumptionToken")
+        next_token: str | None = None
+        if token_element is not None:
+            next_token = token_element.text or None
+        page_records: tuple[HarvestedRecord, ...] = ()
+        for element in xml.iterfind(".//" + self.client.oai_namespace + "record"):
+            record = Record(element)
+            if exclude_deleted and record.deleted:
+                continue
+            page_records = (*page_records, _adapt_record(record))
+        return Page(records=page_records, resumption_token=next_token)
 
     def retrieve_records(
         self,

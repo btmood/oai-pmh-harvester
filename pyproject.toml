@@ -86,6 +86,14 @@ fixture-parentheses = false
     "ANN",
     "ARG001",
     "S101",
+    "PLR2004",
+    "SLF001",
+    "SIM117",
+    "S105",
+    "S106",
+    "S603",
+    "S314",
+    "FBT002",
 ]
 
 [tool.ruff.lint.pycodestyle]

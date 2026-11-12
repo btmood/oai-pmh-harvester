@@ -6,18 +6,27 @@ import json
 import logging
 import sys
 from datetime import timedelta
+from pathlib import Path
 from time import perf_counter
 from typing import Literal
 
 import click
 from sickle.oaiexceptions import NoRecordsMatch
 
+from harvester.checkpoint import (
+    CheckpointError,
+    HarvestParameters,
+    Page,
+    ResumableListHarvest,
+)
 from harvester.config import Config
 from harvester.oai import OAIClient, write_records, write_sets
 
 logger = logging.getLogger(__name__)
 
 CONFIG = Config()
+
+DEFAULT_CHECKPOINT_EVERY = 1000
 
 
 def parse_request_header_mixins(
@@ -37,6 +46,20 @@ def parse_request_header_mixins(
         message = "must be a JSON object with string keys and string values"
         raise click.BadParameter(message)
     return headers
+
+
+def positive_int(
+    _ctx: click.Context, _param: click.Parameter, value: int | None
+) -> int | None:
+    """Click callback validating that an integer option is positive."""
+    if value is not None and value < 1:
+        message = "must be a positive integer"
+        raise click.BadParameter(message)
+    return value
+
+
+def _is_s3_output(output_file: str) -> bool:
+    return output_file.lower().startswith("s3://")
 
 
 @click.group()
@@ -143,6 +166,30 @@ def main(
     help="Pass to exclude deleted records from harvest.",
     is_flag=True,
 )
+@click.option(
+    "--state-dir",
+    default=None,
+    type=click.Path(),
+    help="Directory in which to persist harvested records and progress for a "
+    "resumable harvest. Only supported with --method=list and a local output "
+    "file. Resuming requires passing --resume alongside this option.",
+)
+@click.option(
+    "--checkpoint-every",
+    default=DEFAULT_CHECKPOINT_EVERY,
+    show_default=True,
+    callback=positive_int,
+    type=int,
+    help="Save progress at least once per this many harvested records. Must be a "
+    "positive integer. Only used together with --state-dir.",
+)
+@click.option(
+    "--resume",
+    is_flag=True,
+    default=False,
+    help="Resume the harvest previously persisted in --state-dir. All other harvest "
+    "parameters must match the original run.",
+)
 @click.pass_context
 def harvest(
     ctx: click.Context,
@@ -153,6 +200,9 @@ def harvest(
     set_spec: str,
     skip_record: tuple[str] | None,
     exclude_deleted: bool,
+    state_dir: str | None,
+    checkpoint_every: int,
+    resume: bool,
 ) -> None:
     """Harvest command to retrieve records from an OAI-PMH compliant source."""
     logger.info(
@@ -169,6 +219,9 @@ def harvest(
         exclude_deleted,
     )
 
+    output_file = ctx.obj["OUTPUT_FILE"]
+    _validate_checkpoint_options(method, output_file, state_dir, checkpoint_every, resume)
+
     oai_client = OAIClient(
         ctx.obj["HOST"],
         metadata_format,
@@ -183,18 +236,29 @@ def harvest(
             "records will not be skipped during harvest: %s",
             skip_record,
         )
-    try:
-        records = oai_client.retrieve_records(
-            method, exclude_deleted=exclude_deleted, skip_records=skip_record or None
+
+    if state_dir:
+        count = _run_resumable_harvest(
+            oai_client,
+            host=ctx.obj["HOST"],
+            output_file=output_file,
+            metadata_format=metadata_format,
+            from_date=from_date,
+            until_date=until_date,
+            set_spec=set_spec,
+            exclude_deleted=exclude_deleted,
+            state_dir=state_dir,
+            checkpoint_every=checkpoint_every,
+            resume=resume,
         )
-        logger.info("Writing records to output file: %s", ctx.obj["OUTPUT_FILE"])
-        count = write_records(records, ctx.obj["OUTPUT_FILE"])
-    except NoRecordsMatch:
-        logger.info(
-            "No records harvested: the combination of the provided options results in "
-            "an empty list."
+    else:
+        count = _run_standard_harvest(
+            oai_client,
+            method=method,
+            exclude_deleted=exclude_deleted,
+            skip_record=skip_record,
+            output_file=output_file,
         )
-        sys.exit()
 
     logger.info(
         "Harvest completed. Total records harvested (%sincluding deleted records): %d",
@@ -205,6 +269,107 @@ def harvest(
     logger.info(
         "Total time to complete harvest: %s", str(timedelta(seconds=elapsed_time))
     )
+
+
+def _validate_checkpoint_options(
+    method: str,
+    output_file: str,
+    state_dir: str | None,
+    checkpoint_every: int,
+    resume: bool,
+) -> None:
+    """Reject resumable-harvest options where they are not supported."""
+    if state_dir is None:
+        if resume:
+            message = "--resume requires --state-dir"
+            raise click.UsageError(message)
+        if checkpoint_every != DEFAULT_CHECKPOINT_EVERY:
+            message = "--checkpoint-every can only be used together with --state-dir"
+            raise click.UsageError(message)
+        return
+    if method != "list":
+        message = "Resumable harvests (--state-dir) are only supported with --method=list"
+        raise click.UsageError(message)
+    if _is_s3_output(output_file):
+        message = (
+            "Resumable harvests (--state-dir) require a local output file; S3 "
+            "output is not supported"
+        )
+        raise click.UsageError(message)
+    if checkpoint_every < 1:
+        message = "--checkpoint-every must be a positive integer"
+        raise click.BadParameter(message, param_hint="'--checkpoint-every'")
+
+
+def _run_standard_harvest(
+    oai_client: OAIClient,
+    method: Literal["get", "list"],
+    exclude_deleted: bool,
+    skip_record: tuple[str] | None,
+    output_file: str,
+) -> int:
+    try:
+        records = oai_client.retrieve_records(
+            method, exclude_deleted=exclude_deleted, skip_records=skip_record or None
+        )
+        logger.info("Writing records to output file: %s", output_file)
+        return write_records(records, output_file)
+    except NoRecordsMatch:
+        logger.info(
+            "No records harvested: the combination of the provided options results in "
+            "an empty list."
+        )
+        sys.exit()
+
+
+def _run_resumable_harvest(
+    oai_client: OAIClient,
+    host: str,
+    output_file: str,
+    metadata_format: str,
+    from_date: str,
+    until_date: str,
+    set_spec: str,
+    exclude_deleted: bool,
+    state_dir: str,
+    checkpoint_every: int,
+    resume: bool,
+) -> int:
+    absolute_output = str(Path(output_file).resolve())
+    parameters = HarvestParameters(
+        host=host,
+        output_file=absolute_output,
+        metadata_format=metadata_format,
+        from_date=from_date,
+        until_date=until_date,
+        set_spec=set_spec,
+        exclude_deleted=exclude_deleted,
+    )
+
+    def page_fetcher(token: str | None) -> Page:
+        return oai_client.list_records_page(
+            exclude_deleted=exclude_deleted, resumption_token=token
+        )
+
+    harvest_run = ResumableListHarvest(
+        state_dir=Path(state_dir).resolve(),
+        output_file=Path(absolute_output),
+        parameters=parameters,
+        page_fetcher=page_fetcher,
+        checkpoint_every=checkpoint_every,
+        resume=resume,
+    )
+    logger.info(
+        "%s resumable harvest using state directory %s",
+        "Resuming" if resume else "Starting",
+        state_dir,
+    )
+    try:
+        with harvest_run:
+            return harvest_run.run()
+    except CheckpointError as exception:
+        logger.exception("Resumable harvest failed")
+        raise click.ClickException(str(exception)) from exception
 
 
 @main.command()
